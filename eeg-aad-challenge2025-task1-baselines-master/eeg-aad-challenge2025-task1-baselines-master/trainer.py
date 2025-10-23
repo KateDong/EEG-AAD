@@ -22,6 +22,7 @@ import matplotlib.pyplot as plt
 from utils import *
 from collections import OrderedDict
 from model_module import DARNet
+from mne.decoding import CSP
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -83,34 +84,6 @@ class Trynetwork():
 
     def __getModel__(self):
         return self.model
-
-    def save_acc_loss_fig(self, args, sub_id):
-
-        valid_acc = self.epoch_df['valid_acc'].values.tolist()
-        valid_loss = self.epoch_df['valid_loss'].values.tolist()
-        train_acc = self.epoch_df['train_acc'].values.tolist()
-        train_loss = self.epoch_df['train_loss'].values.tolist()
-
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
-
-        # First subgraph: Accuracy and loss of training data
-        ax1.plot(range(len(train_acc)), train_acc, label='Train Accuracy', color='blue', linewidth=0.7)
-        ax1.plot(range(len(valid_acc)), valid_acc, label='Valid Accuracy', color='red', linewidth=0.7)
-        ax1.set_title('Acc Performance')
-        ax1.set_xlabel('Epoch')
-        ax1.set_ylabel('Accuracy')
-        ax1.legend(loc='upper right')
-
-        # Second subgraph: Accuracy and loss of test data
-        ax2.plot(range(len(train_loss)), train_loss, label='Train Loss', color='green', linewidth=0.7)
-        ax2.plot(range(len(valid_loss)), valid_loss, label='Valid Loss', color='purple', linewidth=0.7)
-        ax2.set_title('Loss Performance')
-        ax2.set_xlabel('Epoch')
-        ax2.set_ylabel('Loss')
-        ax2.legend(loc='upper right')
-
-        plt.tight_layout()  
-        plt.savefig(os.path.join(args.fig_path, 'Loss_Acc.png'))
 
     def train_step(self):
         self.model.train()
@@ -208,16 +181,27 @@ class Trynetwork():
                                                                                                                                                 val_loss,
                                                                                                                                                 train_acc,
                                                                                                                                                 val_acc))
-            if val_acc > best_acc:
+            '''if val_acc > best_acc:
+                save_model(args, testsub_name, best_acc, val_acc, self.model, epoch, args.model)
+                best_acc = val_acc
+                best_epoch = epoch'''
+            if  val_acc > best_acc:
                 save_model(args, testsub_name, best_acc, val_acc, self.model, epoch, args.model)
                 best_acc = val_acc
                 best_epoch = epoch
+                # save_model(args, model, name=args.name)
+                stale = 0
+            else:
+                stale += 1
+                if stale > args.patience:
+                    print(f"Early stopping at epoch {epoch}!")
+                    break
     
             self.epoch_df = pd.concat([self.train_df, self.val_df], axis=1)
         model = load_model(args.model_save_path, testsub_name, args.model)
         self.model = model
         test_loss, model_test_acc = self.evaluate_step(True)
-        self.save_acc_loss_fig(args, testsub_id)
+        # self.save_acc_loss_fig(args, testsub_id)
         print("-" * 50)
         print('Test_Subject :{:s} |Best epoch:{:d} | Test Loss:{:2.4f} | Best Acc {:2.4f} | Savemodel Acc {:2.4f}'.format(testsub_name,
                                                                                                     best_epoch,
@@ -228,40 +212,21 @@ class Trynetwork():
         return model_test_acc
     
 
-
-def cross_subject(args, sub_ids, train_ids, val_ids, seq_alldata, alllabel):
-    tempt_data, tempt_label = copy.deepcopy(seq_alldata), copy.deepcopy(alllabel)
-
-    # get val data
-    val_data, val_label = [], []
-    val_index = [sub_ids.index(val_id) for val_id in val_ids]
-    for idx in sorted(val_index, reverse=True):
-        val_data.append(tempt_data[idx])
-        val_label.append(tempt_label[idx])
-
-    # get train data
-    train_data = [seq for idx, seq in enumerate(tempt_data) if sub_ids[idx] in train_ids]
-    train_label = [lbl for idx, lbl in enumerate(tempt_label) if sub_ids[idx] in train_ids]
-    
-    train_data = np.concatenate(train_data, axis=0)
-    train_label = np.concatenate(train_label, axis=0)
-    train_label = train_label.flatten()
-    val_data = np.concatenate(val_data, axis=0)
-    val_label = np.concatenate(val_label, axis=0)
-    val_label = val_label.flatten()
-
-    train_data = np.squeeze(train_data)
-    val_data = np.squeeze(val_data)
-
+def cross_session(args, sub_id, train_data,  train_label, val_data,  val_label):
     train_label = train_label.reshape(-1,1)
     val_label = val_label.reshape(-1,1)
+
+    indices = np.arange(train_data.shape[0])
+    np.random.shuffle(indices)
+    train_data, train_label = train_data[indices], train_label[indices]
+    val_data, val_label = val_data[indices], val_label[indices]
     
     print(f"train_data_shape{train_data.shape},val_data_shape{val_data.shape}")
 
     train_loader = DataLoader(dataset=CustomDatasets(train_data, train_label),
-                                  batch_size=args.batch_size, drop_last=True, shuffle=True)
-    valid_loader  = DataLoader(dataset=CustomDatasets(val_data, val_label),
-                                  batch_size=args.batch_size, drop_last=True)
+                              batch_size=args.batch_size, drop_last=False, pin_memory=True)
+    valid_loader = DataLoader(dataset=CustomDatasets(val_data, val_label),
+                              batch_size=args.batch_size, drop_last=False, pin_memory=True)
     
     #####################################################################################
     #2.define model
@@ -274,7 +239,7 @@ def cross_subject(args, sub_ids, train_ids, val_ids, seq_alldata, alllabel):
         batch_size = args.batch_size, 
         lr = args.lr,
         weight_decay = args.weight_decay)
-    model_val_acc = BaselineNet.train(args, val_ids)
+    model_val_acc = BaselineNet.train(args, sub_id)
     return model_val_acc
 
     
@@ -285,18 +250,24 @@ if __name__ == '__main__':
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed(args.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark   = False
 
     # data
     args.dataset = 'MM-AAD'
-    args.start_time = datetime.now().strftime(f"task1_AAD_{args.dataset}_%Y-%m-%d-%H-%M-%S")
+    args.start_time = datetime.now().strftime(f"task2_AAD_{args.dataset}_%Y-%m-%d-%H-%M-%S")
     print('start time:',args.start_time)
-    options = {'MM-AAD':[40 ,32, 20, 128, "eeg-aad-challenge2025-task1-baselines-master/data/", "eeg-aad-challenge2025-task1-baselines-master/label/"]}
+
+    options = {'MM-AAD':[40 ,32, 20, 128]}
     args.subject_number = options[args.dataset][0]
     args.eeg_channel = options[args.dataset][1]
     args.trail_number = options[args.dataset][2]
     args.fs  = options[args.dataset][3]
-    args.data_path = options[args.dataset][4]
-    args.label_path = options[args.dataset][5]
+    args.source_data_path = "/media/gaoyoudian/DXG/dataset_v2/pre_aoall" #Your source_data_path
+    args.source_label_path = "/media/gaoyoudian/DXG/dataset_v2/pre_aoall"#Your source_label_path
+
+    args.target_data_path = "/media/gaoyoudian/DXG/dataset_v2/pre_avall"#Your target_data_path
+    args.target_label_path = "/media/gaoyoudian/DXG/dataset_v2/pre_avall"#Your target_label_path
 
     args.win_time = 1
     args.win_len = math.ceil(args.fs * args.win_time)
@@ -311,15 +282,14 @@ if __name__ == '__main__':
     args.lr_decayrate = 0.5
     args.weight_decay = 3e-4
     args.max_epoch = 100
-    args.patience = 10
+    args.patience = 15
     args.log_interval = 10
+    args.csp_comp = args.eeg_channel
     
     # save to 
-    filename = "./exps/cross-subject/%s/" % args.model
-    args.model_save_path = f'{filename}baseline_%s' % args.start_time
+    filename = "./exps/cross-session/%s/" % args.model
+    args.model_save_path = f'{filename}baseline_%s/' % args.start_time
     makePath(args.model_save_path)
-    args.fig_path = f'{filename}figures/' 
-    makePath(args.fig_path)
 
     print('=' * 108)
     print('Arguments =')
@@ -331,15 +301,27 @@ if __name__ == '__main__':
     del_ids = [31,32,33,34,35,36,37,38,39,40]
     sub_ids = [sub_id for sub_id in sub_ids if sub_id not in del_ids]
 
-    val_ids =  [1,2,3,6]
-    train_ids = [sub_id for sub_id in sub_ids if sub_id not in val_ids]
+    all_acc = []
+    for id in sub_ids:  
+        source_alldata,  source_alllabel = getData(args.source_data_path, args.source_label_path, id)
+        target_alldata,  target_alllabel = getData(args.target_data_path, args.target_label_path, id)
 
-    seq_alldata,  alllabel = getData(args, sub_ids)
-    savemodel_acc = cross_subject(args, sub_ids, train_ids, val_ids, seq_alldata,  alllabel)
+        csp = CSP(n_components=args.csp_comp, reg=None, log=None, cov_est='concat', transform_into='csp_space',
+                norm_trace=True)
+        train_data = csp.fit_transform(source_alldata, source_alllabel)
+        val_data = csp.transform(target_alldata)
+
+        savemodel_acc = cross_session(args, id, train_data,  source_alllabel, val_data,  target_alllabel)
+        all_acc.append(savemodel_acc)
+        # savemodel_acc = cross_subject(args, sub_ids, train_ids, val_ids, seq_alldata,  alllabel)
+
+    print('=' * 108)
+    for i, acc in enumerate(all_acc):
+        print("sub{} -> acc: {:.4f}%".format(sub_ids[i], acc))
+    print('=' * 108)
 
     print(f"lr:{args.lr } -> bs:{args.batch_size}")
-    print(f"Cross Subject -> val_ids: {val_ids}")
-    print(f"Cross Subject -> Result ACC mean: {savemodel_acc:.4f}")
+    print(f"Cross Session -> Result ACC mean: {np.mean(all_acc):.4f}")
     print('=' * 108)
     now1 = datetime.now().strftime("%y-%m-%d-%H:%M:%S")
     print('end time:',now1)
